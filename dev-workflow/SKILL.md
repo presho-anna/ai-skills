@@ -43,7 +43,7 @@ Read the ticket and classify it. State the size and why in your progress summary
 
 ## Step 1: Planner (Opus)
 
-Spawn an agent with `model="opus"`. Its prompt is the full protocol in `references/planner.md` — read that file and include it verbatim, plus the ticket, the size class, and the read budget from the table above.
+Spawn an agent with `model="opus"`. Its prompt is the full protocol in `references/planner.md` — read that file and include it in the subagent prompt, **replacing the `{READ_BUDGET}` placeholder with the number from the sizing table above** (this is a manual fill-in, not automatic substitution), then append the ticket and the size class.
 
 The short version of what that protocol enforces:
 
