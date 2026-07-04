@@ -1,105 +1,98 @@
 ---
 name: dev-workflow
-description: Run a 4-agent development workflow (Planner, Coder, Tester, Reviewer) with a shared .pipeline folder for inter-agent context.
+description: Run a sized, gated multi-agent development workflow (Planner, Coder, Tester, Reviewer) with a shared .pipeline/ folder and an append-only decision log. Use this whenever the user invokes /dev-workflow, hands over a Jira ticket, bug report, feature request, or refactor task, or asks for a "structured" or "pipelined" implementation. Also use it when the user asks to resume, iterate on, or review a previous .pipeline/ run.
 ---
 
 # Dev Workflow
 
-A multi-agent pipeline that takes a vague feature request through planning, implementation, testing, and review — each handled by a specialized agent on a different model, communicating via a shared `.pipeline/` folder.
+A multi-agent pipeline that takes a ticket through planning, implementation, testing, and review — sized to the ticket, gated by the user, and leaving an audit trail in a shared decision log.
 
-## When to use
+Two principles govern everything below:
 
-Invoke with `/dev-workflow` when you want a structured development process for a feature, bugfix, or refactor.
+1. **Effort is budgeted, not open-ended.** Every agent gets explicit read/time budgets and stop conditions. Exhausting a budget means *stop and ask*, never *keep reading*.
+2. **Nothing diverges silently.** Any decision that isn't literally in the ticket — a rename, a pattern choice, a deviation from spec, a discovered hazard — goes in `.pipeline/decisions.md`. An undocumented divergence is a review failure.
 
 ## Shared context: `.pipeline/`
 
-Before starting, create a `.pipeline/` directory in the project root. Each agent writes its output there so the next agent can read it:
+| File                     | Written by            | Read by                 |
+| ------------------------ | --------------------- | ----------------------- |
+| `.pipeline/spec.md`      | Planner               | Coder, Tester, Reviewer |
+| `.pipeline/decisions.md` | **All agents** (append-only) | All agents, User  |
+| `.pipeline/changes.md`   | Coder                 | Tester, Reviewer        |
+| `.pipeline/tests.md`     | Tester                | Reviewer                |
+| `.pipeline/review.md`    | Reviewer              | User                    |
+| `.pipeline/baseline.sha` | Setup                 | Reviewer                |
 
-| File | Written by | Read by |
-|------|-----------|---------|
-| `.pipeline/spec.md` | Planner | Coder, Tester, Reviewer |
-| `.pipeline/changes.md` | Coder | Tester, Reviewer |
-| `.pipeline/tests.md` | Tester | Reviewer |
-| `.pipeline/review.md` | Reviewer | User |
+Decision log format and entry types: read `references/decision-log.md` before Step 0, and include its rules in every agent's prompt.
 
-## Workflow
+## Step 0: Setup
 
-When the user provides a task description, execute these steps in order:
+- Create `.pipeline/` in the project root; ensure it is in `.gitignore`
+- Record current HEAD: `git rev-parse HEAD > .pipeline/baseline.sha`
+- Create `.pipeline/decisions.md` from the template in `references/decision-log.md`
 
-### Step 0: Setup
+## Step 0.5: Sizing gate (before spawning any agent)
 
-- Create `.pipeline/` in the project root
-- Ensure `.pipeline/` is listed in `.gitignore`
-- Record the current HEAD sha (store in `.pipeline/baseline.sha`) — the Reviewer diffs against this, not the working tree
+Read the ticket and classify it. State the size and why in your progress summary. When in doubt between two sizes, pick the smaller — the spec-approval gate catches undersizing cheaply; oversizing burns 17 minutes on a rename.
 
-### Step 1: Planner (Opus)
+| Size | Signals | Pipeline shape | Planner read budget |
+| ---- | ------- | -------------- | ------------------- |
+| **S** | Single-file or few-line change; clear repro or exact location named in ticket; no design decisions | No Planner agent. Orchestrator writes a mini-spec (≤ 15 lines: files, change, edge cases, test location) directly into `spec.md`, gates with user, then one Sonnet agent does Coder+Tester combined. Reviewer still runs. | ≤ 5 files |
+| **M** | Touches 2–5 files; one subsystem; some design choice but within existing patterns | Full 4-agent pipeline, standard budgets | ≤ 15 files |
+| **L** | New subsystem, cross-cutting change, migration, or ambiguous scope | Full pipeline, extended budgets, **mandatory** clarifying-question round before the spec | ≤ 30 files |
 
-Spawn an agent with `model="opus"`:
-- Read the existing project structure, relevant source files, and any CLAUDE.md / README first
-- Take the vague feature request and turn it into a detailed spec
-- Match existing naming conventions, patterns, and directory structure
-- The spec MUST include:
-  - Exact file paths to create or modify
-  - Function signatures (name, params, return type)
-  - Edge cases and how to handle each one
-  - Acceptance criteria
-  - Test file paths and the test framework/runner to use
-- Write the spec to `.pipeline/spec.md`
+## Step 1: Planner (Opus)
 
-**Gate:** After writing the spec, pause and show the user a summary. Only proceed to Step 2 when the user approves.
+Spawn an agent with `model="opus"`. Its prompt is the full protocol in `references/planner.md` — read that file and include it verbatim, plus the ticket, the size class, and the read budget from the table above.
 
-### Step 2: Coder (Sonnet)
+The short version of what that protocol enforces:
 
-Spawn an agent with `model="sonnet"`:
-- Read `.pipeline/spec.md`
-- Build exactly what the spec says — no improvisation, no extras
-- Write production-ready code (no placeholders or TODOs)
-- Make actual file edits
-- Write a summary of all changes (files modified, functions added/changed) to `.pipeline/changes.md`
+- **Triage unknowns before exploring.** Repo-answerable questions get targeted searches; user-only questions (intent, scope, priorities) get asked at the gate — max 5. Never explore to compensate for an ambiguous ticket.
+- **Search-first, budgeted discovery.** Grep/glob from ticket keywords; read only hits; count every file read against the budget; one exemplar file per convention, not the whole namespace.
+- **Fenced-off paths.** No dependency source (gems, `node_modules/`, `vendor/`), no lockfiles, no generated files, no second examples of an already-understood pattern.
+- **Stop condition.** The moment the Planner can name the files to change, the pattern to follow, and where tests go — it stops and writes the spec. Budget exhausted with questions remaining → stop and ask, don't keep reading.
 
-### Step 3: Tester (Sonnet)
+The spec MUST still include: exact file paths to create/modify, function signatures, edge cases and handling, acceptance criteria, test file paths and runner.
+
+**Gate:** Show the user (a) a spec summary, (b) the Planner's open questions, (c) new `decisions.md` entries, and (d) the Planner's budget report (files read / budget, time). Proceed only on approval. If the user answers questions, the Planner amends the spec and logs each answer-driven choice as a decision — it does not re-explore.
+
+## Step 2: Coder (Sonnet)
 
 Spawn an agent with `model="sonnet"`:
-- Read `.pipeline/spec.md`, `.pipeline/changes.md`, and the actual code the Coder wrote
-- Write test cases covering:
-  - Happy path for each function/feature
-  - Every edge case identified in `.pipeline/spec.md`
-- Place tests at the paths specified in the spec
-- Make actual test file edits
-- Write a summary of test coverage to `.pipeline/tests.md`
 
-### Step 4: Reviewer (Opus)
+- Read `.pipeline/spec.md` and `.pipeline/decisions.md`
+- Build exactly what the spec says — production-ready, no placeholders
+- **If reality forces a deviation from the spec** (spec path doesn't exist, signature can't work, a name collides): log a `DIVERGENCE` entry in `decisions.md` *before* implementing the workaround, and flag it in `changes.md`. Silent improvisation is prohibited.
+- Discover something dangerous or surprising (fragile coupling, dead code that isn't, a footgun)? Log it as `HEREBEDRAGONS`.
+- Write a summary of all changes to `.pipeline/changes.md`
 
-Spawn an agent with `model="opus"`:
-- **READ-ONLY — this agent MUST NOT edit any code or test files**
-- Read `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/tests.md`
-- Read the actual source and test files
-- Run a diff against the baseline sha (`git diff <baseline>`) to see exactly what changed
-- Give a verdict:
-  - Does the code match the spec?
-  - Are there correctness, performance, or security issues?
-  - Are the tests sufficient?
-  - Pass / Fail with specific reasons
-- Write the verdict to `.pipeline/review.md`
-- If issues are found, summarize them for the user and ask whether to iterate
+## Step 3: Tester (Sonnet)
+
+Spawn an agent with `model="sonnet"`:
+
+- Read `spec.md`, `changes.md`, `decisions.md`, and the actual code
+- Cover the happy path and every edge case in the spec; place tests at the spec's paths; run them
+- A test that can only pass by contradicting the spec → log `DIVERGENCE`, do not quietly adjust the assertion
+- Write coverage summary to `.pipeline/tests.md`
+
+## Step 4: Reviewer (Opus)
+
+Spawn an agent with `model="opus"` — **strictly read-only** (verdicts, never fixes):
+
+- Read all `.pipeline/` files, the source, the tests; diff with `git diff $(cat .pipeline/baseline.sha)`
+- Verdict on: spec conformance; correctness/performance/security; test sufficiency
+- **Decision-log audit:** walk the diff against the spec. Every behavioral or naming difference must have a `decisions.md` entry. Any undocumented divergence = **Fail** with the entry that should have existed.
+- Write verdict to `.pipeline/review.md`; if Fail, summarize for the user and ask whether to iterate
 
 ## Iteration
 
-When the Reviewer gives a **Fail** verdict:
-1. Feed `.pipeline/review.md` back to the Coder as additional context
-2. The Coder re-reads the spec + review feedback, makes fixes, updates `.pipeline/changes.md`
-3. Re-run Tester (updates `.pipeline/tests.md` if needed)
-4. Re-run Reviewer (overwrites `.pipeline/review.md` with new verdict)
-
-Repeat until Pass or the user decides to stop.
+On **Fail**: feed `review.md` to the Coder → Coder fixes and updates `changes.md` (logging any new divergences) → re-run Tester → re-run Reviewer. Repeat until Pass or the user stops. `decisions.md` is never rewritten between iterations — only appended.
 
 ## Rules
 
-- Each agent writes to `.pipeline/` — this is how context flows between agents
-- Agents run sequentially; each depends on the previous agent's output
-- The Planner must explore the codebase before writing the spec
+- Agents run sequentially; context flows only through `.pipeline/`
 - The user approves the spec before implementation begins
-- The Reviewer is strictly read-only — it gives a verdict, never fixes code
-- `.pipeline/` persists after completion for reference context
-- Report a brief summary after each step completes so the user can follow progress
-- Keep each agent's prompt focused on its role and the files it needs to read
+- `decisions.md` is append-only; every agent reads it on start and may append; only the format in `references/decision-log.md` is valid
+- Budgets are hard limits: an agent that hits one reports state and stops; the orchestrator asks the user before granting more
+- Report a brief summary (including any new decision entries) after each step
+- `.pipeline/` persists after completion — it is the record of what was decided and why
